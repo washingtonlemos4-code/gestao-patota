@@ -1,0 +1,693 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const dataDir = path.join(__dirname, 'data');
+const dbPath = path.join(dataDir, 'gestao_patota.sqlite');
+
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const db = new sqlite3.Database(dbPath);
+
+const runDb = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve({ id: this.lastID, changes: this.changes });
+    });
+  });
+
+const allDb = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows);
+    });
+  });
+
+const getDb = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row);
+    });
+  });
+
+const defaultConfig = {
+  nome_patota: 'Gestão da Patota',
+  nome_curto: 'Patota',
+  logo: '',
+  valor_mensalidade: 150,
+  dia_vencimento: 5,
+  temporada: '2026',
+  administrador: 'Administrador'
+};
+
+const initDatabase = async () => {
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS configuracoes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nome_patota TEXT,
+      nome_curto TEXT,
+      logo TEXT,
+      valor_mensalidade REAL,
+      dia_vencimento INTEGER,
+      temporada TEXT,
+      administrador TEXT
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS atletas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nome TEXT NOT NULL,
+      apelido TEXT,
+      numero_camisa INTEGER,
+      posicao TEXT,
+      telefone TEXT,
+      data_nascimento TEXT,
+      foto TEXT,
+      status TEXT DEFAULT 'ativo',
+      observacoes TEXT,
+      criado_em TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS jogos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      data TEXT NOT NULL,
+      horario TEXT,
+      adversario TEXT NOT NULL,
+      local TEXT,
+      gols_patota INTEGER DEFAULT 0,
+      gols_adversario INTEGER DEFAULT 0,
+      observacoes TEXT,
+      status TEXT DEFAULT 'finalizado',
+      criado_em TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS gols (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      jogo_id INTEGER NOT NULL,
+      atleta_id INTEGER NOT NULL,
+      minuto TEXT,
+      tipo TEXT DEFAULT 'normal',
+      FOREIGN KEY(jogo_id) REFERENCES jogos(id) ON DELETE CASCADE,
+      FOREIGN KEY(atleta_id) REFERENCES atletas(id)
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS participacoes_jogo (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      jogo_id INTEGER NOT NULL,
+      atleta_id INTEGER NOT NULL,
+      titular INTEGER DEFAULT 0,
+      observacoes TEXT,
+      FOREIGN KEY(jogo_id) REFERENCES jogos(id) ON DELETE CASCADE,
+      FOREIGN KEY(atleta_id) REFERENCES atletas(id)
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS goleiros_jogo (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      jogo_id INTEGER NOT NULL,
+      atleta_id INTEGER NOT NULL,
+      minutos_jogados TEXT,
+      observacoes TEXT,
+      FOREIGN KEY(jogo_id) REFERENCES jogos(id) ON DELETE CASCADE,
+      FOREIGN KEY(atleta_id) REFERENCES atletas(id)
+    )
+  `);
+
+  await runDb(`
+    CREATE TABLE IF NOT EXISTS mensalidades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      atleta_id INTEGER NOT NULL,
+      mes INTEGER NOT NULL,
+      ano INTEGER NOT NULL,
+      valor REAL DEFAULT 0,
+      status TEXT DEFAULT 'pendente',
+      data_pagamento TEXT,
+      forma_pagamento TEXT,
+      observacao TEXT,
+      UNIQUE(atleta_id, mes, ano),
+      FOREIGN KEY(atleta_id) REFERENCES atletas(id)
+    )
+  `);
+
+  const existing = await getDb('SELECT COUNT(*) AS total FROM configuracoes');
+  if (existing.total === 0) {
+    await runDb(
+      `INSERT INTO configuracoes (nome_patota, nome_curto, logo, valor_mensalidade, dia_vencimento, temporada, administrador) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        defaultConfig.nome_patota,
+        defaultConfig.nome_curto,
+        defaultConfig.logo,
+        defaultConfig.valor_mensalidade,
+        defaultConfig.dia_vencimento,
+        defaultConfig.temporada,
+        defaultConfig.administrador
+      ]
+    );
+  }
+};
+
+const getStatusFromPlacar = (patota, adversario) => {
+  if (patota > adversario) return 'Vitória';
+  if (patota < adversario) return 'Derrota';
+  return 'Empate';
+};
+
+const getDashboard = async () => {
+  const atletas = await allDb(`SELECT * FROM atletas WHERE status = 'ativo'`);
+  const jogos = await allDb(`SELECT * FROM jogos ORDER BY data DESC`);
+
+  const totalAtletas = atletas.length;
+  const totalJogos = jogos.length;
+  const vitorias = jogos.filter((j) => Number(j.gols_patota) > Number(j.gols_adversario)).length;
+  const empates = jogos.filter((j) => Number(j.gols_patota) === Number(j.gols_adversario)).length;
+  const derrotas = jogos.filter((j) => Number(j.gols_patota) < Number(j.gols_adversario)).length;
+
+  const golsMarcados = jogos.reduce((sum, jogo) => sum + Number(jogo.gols_patota || 0), 0);
+  const golsSofridos = jogos.reduce((sum, jogo) => sum + Number(jogo.gols_adversario || 0), 0);
+  const saldoGols = golsMarcados - golsSofridos;
+  const aproveitamento = totalJogos > 0 ? (vitorias / totalJogos) * 100 : 0;
+
+  const artilheiro = await getDb(`
+    SELECT a.id, a.nome, a.apelido, COUNT(g.id) AS gols
+    FROM gols g
+    JOIN atletas a ON a.id = g.atleta_id
+    WHERE g.tipo = 'normal'
+    GROUP BY a.id, a.nome, a.apelido
+    ORDER BY gols DESC, a.nome ASC
+    LIMIT 1
+  `);
+
+  const goleiroMaisVazado = await getDb(`
+    SELECT a.id, a.nome, SUM(j.gols_adversario) AS gols_sofridos, COUNT(DISTINCT j.id) AS jogos
+    FROM goleiros_jogo gj
+    JOIN atletas a ON a.id = gj.atleta_id
+    JOIN jogos j ON j.id = gj.jogo_id
+    GROUP BY a.id, a.nome
+    ORDER BY gols_sofridos DESC, a.nome ASC
+    LIMIT 1
+  `);
+
+  const mensalidades = await allDb(`SELECT * FROM mensalidades`);
+  const pagas = mensalidades.filter((m) => m.status === 'pago').length;
+  const pendentes = mensalidades.filter((m) => m.status === 'pendente').length;
+  const totalRecebido = mensalidades
+    .filter((m) => m.status === 'pago')
+    .reduce((sum, item) => sum + Number(item.valor || 0), 0);
+  const totalPendente = mensalidades
+    .filter((m) => m.status === 'pendente')
+    .reduce((sum, item) => sum + Number(item.valor || 0), 0);
+
+  const ultimosJogos = jogos.slice(0, 5);
+
+  const rankingArtilheiros = await allDb(`
+    SELECT a.id, a.nome, a.apelido, COUNT(g.id) AS gols
+    FROM gols g
+    JOIN atletas a ON a.id = g.atleta_id
+    WHERE g.tipo = 'normal'
+    GROUP BY a.id, a.nome, a.apelido
+    ORDER BY gols DESC, a.nome ASC
+    LIMIT 5
+  `);
+
+  return {
+    totalAtletas,
+    totalJogos,
+    vitorias,
+    empates,
+    derrotas,
+    golsMarcados,
+    golsSofridos,
+    saldoGols,
+    aproveitamento: Number(aproveitamento.toFixed(2)),
+    artilheiro,
+    goleiroMaisVazado,
+    pagas,
+    pendentes,
+    totalRecebido: Number(totalRecebido.toFixed(2)),
+    totalPendente: Number(totalPendente.toFixed(2)),
+    ultimosJogos,
+    rankingArtilheiros
+  };
+};
+
+const getArtilharia = async () => {
+  const rows = await allDb(`
+    SELECT a.id, a.nome, a.apelido, COUNT(g.id) AS gols,
+      COUNT(DISTINCT j.id) AS jogos_disputados
+    FROM atletas a
+    LEFT JOIN gols g ON g.atleta_id = a.id AND g.tipo = 'normal'
+    LEFT JOIN jogos j ON j.id = g.jogo_id
+    WHERE a.status = 'ativo'
+    GROUP BY a.id, a.nome, a.apelido
+    HAVING COUNT(g.id) > 0
+    ORDER BY gols DESC, a.nome ASC
+  `);
+
+  return rows.map((item, index) => ({
+    posicao: index + 1,
+    ...item,
+    media: Number(item.jogos_disputados ? (Number(item.gols) / Number(item.jogos_disputados)).toFixed(2) : 0)
+  }));
+};
+
+const getGoleiros = async () => {
+  const rows = await allDb(`
+    SELECT a.id, a.nome, a.apelido, COUNT(DISTINCT gj.jogo_id) AS jogos,
+      SUM(j.gols_adversario) AS gols_sofridos,
+      ROUND(AVG(j.gols_adversario), 2) AS media_gols_sofridos
+    FROM goleiros_jogo gj
+    JOIN atletas a ON a.id = gj.atleta_id
+    JOIN jogos j ON j.id = gj.jogo_id
+    GROUP BY a.id, a.nome, a.apelido
+    ORDER BY gols_sofridos DESC, media_gols_sofridos ASC
+  `);
+
+  return rows.map((item) => ({
+    ...item,
+    jogos: Number(item.jogos || 0),
+    gols_sofridos: Number(item.gols_sofridos || 0),
+    media_gols_sofridos: Number(item.media_gols_sofridos || 0)
+  }));
+};
+
+const getRelatorios = async () => {
+  const jogos = await allDb(`SELECT * FROM jogos ORDER BY data DESC`);
+  const mensalidades = await allDb(`SELECT * FROM mensalidades`);
+
+  const totalJogos = jogos.length;
+  const vitorias = jogos.filter((j) => Number(j.gols_patota) > Number(j.gols_adversario)).length;
+  const empates = jogos.filter((j) => Number(j.gols_patota) === Number(j.gols_adversario)).length;
+  const derrotas = jogos.filter((j) => Number(j.gols_patota) < Number(j.gols_adversario)).length;
+  const golsMarcados = jogos.reduce((sum, j) => sum + Number(j.gols_patota || 0), 0);
+  const golsSofridos = jogos.reduce((sum, j) => sum + Number(j.gols_adversario || 0), 0);
+  const saldo = golsMarcados - golsSofridos;
+  const aproveitamento = totalJogos > 0 ? (vitorias / totalJogos) * 100 : 0;
+
+  const totalRecebido = mensalidades
+    .filter((m) => m.status === 'pago')
+    .reduce((sum, item) => sum + Number(item.valor || 0), 0);
+  const totalPendente = mensalidades
+    .filter((m) => m.status === 'pendente')
+    .reduce((sum, item) => sum + Number(item.valor || 0), 0);
+
+  return {
+    totalJogos,
+    vitorias,
+    empates,
+    derrotas,
+    aproveitamento: Number(aproveitamento.toFixed(2)),
+    golsMarcados,
+    golsSofridos,
+    saldo,
+    mediaGolsMarcados: totalJogos > 0 ? Number((golsMarcados / totalJogos).toFixed(2)) : 0,
+    mediaGolsSofridos: totalJogos > 0 ? Number((golsSofridos / totalJogos).toFixed(2)) : 0,
+    totalRecebido: Number(totalRecebido.toFixed(2)),
+    totalPendente: Number(totalPendente.toFixed(2))
+  };
+};
+
+const formatCurrency = (value) => {
+  return new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL'
+  }).format(Number(value || 0));
+};
+
+app.use(express.json({ limit: '5mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/config', async (req, res) => {
+  const config = await getDb('SELECT * FROM configuracoes ORDER BY id DESC LIMIT 1');
+  res.json(config || defaultConfig);
+});
+
+app.put('/api/config', async (req, res) => {
+  const data = req.body || {};
+  const novo = {
+    nome_patota: data.nome_patota || defaultConfig.nome_patota,
+    nome_curto: data.nome_curto || defaultConfig.nome_curto,
+    logo: data.logo || '',
+    valor_mensalidade: Number(data.valor_mensalidade || 0),
+    dia_vencimento: Number(data.dia_vencimento || 5),
+    temporada: data.temporada || defaultConfig.temporada,
+    administrador: data.administrador || defaultConfig.administrador
+  };
+
+  await runDb(`
+    UPDATE configuracoes
+    SET nome_patota = ?, nome_curto = ?, logo = ?, valor_mensalidade = ?, dia_vencimento = ?, temporada = ?, administrador = ?
+    WHERE id = (SELECT id FROM configuracoes ORDER BY id DESC LIMIT 1)
+  `, [
+    novo.nome_patota,
+    novo.nome_curto,
+    novo.logo,
+    novo.valor_mensalidade,
+    novo.dia_vencimento,
+    novo.temporada,
+    novo.administrador
+  ]);
+
+  const config = await getDb('SELECT * FROM configuracoes ORDER BY id DESC LIMIT 1');
+  res.json({ message: 'Configurações atualizadas com sucesso.', config });
+});
+
+app.get('/api/dashboard', async (req, res) => {
+  res.json(await getDashboard());
+});
+
+app.get('/api/atletas', async (req, res) => {
+  const rows = await allDb('SELECT * FROM atletas ORDER BY nome ASC');
+  res.json(rows);
+});
+
+app.post('/api/atletas', async (req, res) => {
+  const body = req.body || {};
+
+  if (!body.nome || !String(body.nome).trim()) {
+    return res.status(400).json({ error: 'Nome do atleta é obrigatório.' });
+  }
+
+  const existing = await getDb('SELECT id FROM atletas WHERE LOWER(nome) = LOWER(?) LIMIT 1', [String(body.nome).trim()]);
+  if (existing) {
+    return res.status(400).json({ error: 'Já existe um atleta com esse nome.' });
+  }
+
+  const data = {
+    nome: String(body.nome).trim(),
+    apelido: body.apelido || '',
+    numero_camisa: Number(body.numero_camisa || 0),
+    posicao: body.posicao || 'Meia',
+    telefone: body.telefone || '',
+    data_nascimento: body.data_nascimento || null,
+    foto: body.foto || '',
+    status: body.status || 'ativo',
+    observacoes: body.observacoes || ''
+  };
+
+  await runDb(`
+    INSERT INTO atletas (nome, apelido, numero_camisa, posicao, telefone, data_nascimento, foto, status, observacoes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [data.nome, data.apelido, data.numero_camisa, data.posicao, data.telefone, data.data_nascimento, data.foto, data.status, data.observacoes]);
+
+  const atleta = await getDb('SELECT * FROM atletas ORDER BY id DESC LIMIT 1');
+  res.status(201).json({ message: 'Atleta cadastrado com sucesso.', atleta });
+});
+
+app.put('/api/atletas/:id', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+
+  const atleta = await getDb('SELECT * FROM atletas WHERE id = ?', [id]);
+  if (!atleta) {
+    return res.status(404).json({ error: 'Atleta não encontrado.' });
+  }
+
+  await runDb(`
+    UPDATE atletas
+    SET nome = ?, apelido = ?, numero_camisa = ?, posicao = ?, telefone = ?, data_nascimento = ?, foto = ?, status = ?, observacoes = ?
+    WHERE id = ?
+  `, [
+    body.nome || atleta.nome,
+    body.apelido || atleta.apelido,
+    Number(body.numero_camisa || atleta.numero_camisa || 0),
+    body.posicao || atleta.posicao,
+    body.telefone || atleta.telefone,
+    body.data_nascimento || atleta.data_nascimento,
+    body.foto || atleta.foto,
+    body.status || atleta.status,
+    body.observacoes || atleta.observacoes,
+    id
+  ]);
+
+  const atualizado = await getDb('SELECT * FROM atletas WHERE id = ?', [id]);
+  res.json({ message: 'Atleta atualizado com sucesso.', atleta: atualizado });
+});
+
+app.delete('/api/atletas/:id', async (req, res) => {
+  const { id } = req.params;
+  const atleta = await getDb('SELECT * FROM atletas WHERE id = ?', [id]);
+  if (!atleta) {
+    return res.status(404).json({ error: 'Atleta não encontrado.' });
+  }
+
+  await runDb(`UPDATE atletas SET status = 'inativo' WHERE id = ?`, [id]);
+  res.json({ message: 'Atleta desativado com sucesso.' });
+});
+
+app.get('/api/jogos', async (req, res) => {
+  const jogos = await allDb(`SELECT * FROM jogos ORDER BY data DESC, id DESC`);
+  const result = await Promise.all(
+    jogos.map(async (jogo) => {
+      const gols = await allDb(`SELECT g.*, a.nome, a.apelido FROM gols g JOIN atletas a ON a.id = g.atleta_id WHERE g.jogo_id = ? ORDER BY g.id ASC`, [jogo.id]);
+      const goleiros = await allDb(`SELECT gj.*, a.nome, a.apelido FROM goleiros_jogo gj JOIN atletas a ON a.id = gj.atleta_id WHERE gj.jogo_id = ?`, [jogo.id]);
+      const participacoes = await allDb(`SELECT * FROM participacoes_jogo WHERE jogo_id = ?`, [jogo.id]);
+      return { ...jogo, gols, goleiros, participacoes, status: jogo.status || 'finalizado', resultado: getStatusFromPlacar(Number(jogo.gols_patota || 0), Number(jogo.gols_adversario || 0)) };
+    })
+  );
+  res.json(result);
+});
+
+app.get('/api/jogos/:id', async (req, res) => {
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [req.params.id]);
+  if (!jogo) return res.status(404).json({ error: 'Partida não encontrada.' });
+
+  const gols = await allDb(`SELECT g.*, a.nome, a.apelido FROM gols g JOIN atletas a ON a.id = g.atleta_id WHERE g.jogo_id = ? ORDER BY g.id ASC`, [jogo.id]);
+  const goleiros = await allDb(`SELECT gj.*, a.nome, a.apelido FROM goleiros_jogo gj JOIN atletas a ON a.id = gj.atleta_id WHERE gj.jogo_id = ?`, [jogo.id]);
+  const participacoes = await allDb(`SELECT * FROM participacoes_jogo WHERE jogo_id = ?`, [jogo.id]);
+  res.json({ ...jogo, gols, goleiros, participacoes, resultado: getStatusFromPlacar(Number(jogo.gols_patota || 0), Number(jogo.gols_adversario || 0)) });
+});
+
+app.post('/api/jogos', async (req, res) => {
+  const body = req.body || {};
+
+  if (!body.data) return res.status(400).json({ error: 'A data do jogo é obrigatória.' });
+  if (!body.adversario || !String(body.adversario).trim()) return res.status(400).json({ error: 'O adversário é obrigatório.' });
+
+  const golsPatota = Number(body.gols_patota || 0);
+  const golsAdversario = Number(body.gols_adversario || 0);
+
+  if (golsPatota < 0 || golsAdversario < 0) {
+    return res.status(400).json({ error: 'Placar inválido.' });
+  }
+
+  await runDb(`
+    INSERT INTO jogos (data, horario, adversario, local, gols_patota, gols_adversario, observacoes, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [body.data, body.horario || '', body.adversario.trim(), body.local || '', golsPatota, golsAdversario, body.observacoes || '', body.status || 'finalizado']);
+
+  const jogo = await getDb('SELECT * FROM jogos ORDER BY id DESC LIMIT 1');
+  res.status(201).json({ message: 'Jogo cadastrado com sucesso.', jogo });
+});
+
+app.put('/api/jogos/:id', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [id]);
+
+  if (!jogo) return res.status(404).json({ error: 'Jogo não encontrado.' });
+
+  const golsPatota = Number(body.gols_patota || jogo.gols_patota || 0);
+  const golsAdversario = Number(body.gols_adversario || jogo.gols_adversario || 0);
+
+  await runDb(`
+    UPDATE jogos
+    SET data = ?, horario = ?, adversario = ?, local = ?, gols_patota = ?, gols_adversario = ?, observacoes = ?, status = ?
+    WHERE id = ?
+  `, [
+    body.data || jogo.data,
+    body.horario || jogo.horario,
+    body.adversario || jogo.adversario,
+    body.local || jogo.local,
+    golsPatota,
+    golsAdversario,
+    body.observacoes || jogo.observacoes,
+    body.status || jogo.status,
+    id
+  ]);
+
+  const atualizado = await getDb('SELECT * FROM jogos WHERE id = ?', [id]);
+  res.json({ message: 'Jogo atualizado com sucesso.', jogo: atualizado });
+});
+
+app.delete('/api/jogos/:id', async (req, res) => {
+  const { id } = req.params;
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [id]);
+  if (!jogo) return res.status(404).json({ error: 'Jogo não encontrado.' });
+
+  await runDb('DELETE FROM jogos WHERE id = ?', [id]);
+  res.json({ message: 'Jogo excluído com sucesso.' });
+});
+
+app.post('/api/jogos/:id/gols', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [id]);
+
+  if (!jogo) return res.status(404).json({ error: 'Jogo não encontrado.' });
+
+  const atleta = await getDb('SELECT * FROM atletas WHERE id = ? AND status = ?', [body.atleta_id, 'ativo']);
+  if (!atleta) return res.status(400).json({ error: 'Atleta inválido ou inativo.' });
+
+  await runDb(
+    `INSERT INTO gols (jogo_id, atleta_id, minuto, tipo) VALUES (?, ?, ?, ?)`,
+    [id, body.atleta_id, body.minuto || '', body.tipo || 'normal']
+  );
+
+  const gols = await allDb('SELECT * FROM gols WHERE jogo_id = ? ORDER BY id ASC', [id]);
+  const totalGolsPatota = gols.filter((g) => Number(g.tipo || 1) !== 0).length;
+
+  await runDb(`UPDATE jogos SET gols_patota = ? WHERE id = ?`, [totalGolsPatota, id]);
+
+  res.status(201).json({ message: 'Gol registrado com sucesso.', gols });
+});
+
+app.delete('/api/jogos/:jogoId/gols/:golId', async (req, res) => {
+  const { jogoId, golId } = req.params;
+  await runDb('DELETE FROM gols WHERE id = ? AND jogo_id = ?', [golId, jogoId]);
+
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [jogoId]);
+  const gols = await allDb('SELECT * FROM gols WHERE jogo_id = ?', [jogoId]);
+  await runDb('UPDATE jogos SET gols_patota = ? WHERE id = ?', [gols.length, jogoId]);
+
+  res.json({ message: 'Gol removido com sucesso.' });
+});
+
+app.post('/api/jogos/:id/goleiros', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+  const jogo = await getDb('SELECT * FROM jogos WHERE id = ?', [id]);
+
+  if (!jogo) return res.status(404).json({ error: 'Jogo não encontrado.' });
+
+  const atleta = await getDb('SELECT * FROM atletas WHERE id = ? AND status = ?', [body.atleta_id, 'ativo']);
+  if (!atleta) return res.status(400).json({ error: 'Goleiro inválido ou inativo.' });
+
+  await runDb(
+    `INSERT INTO goleiros_jogo (jogo_id, atleta_id, minutos_jogados, observacoes) VALUES (?, ?, ?, ?)`,
+    [id, body.atleta_id, body.minutos_jogados || '', body.observacoes || '']
+  );
+
+  const goleiros = await allDb('SELECT * FROM goleiros_jogo WHERE jogo_id = ? ORDER BY id ASC', [id]);
+  res.status(201).json({ message: 'Goleiro registrado com sucesso.', goleiros });
+});
+
+app.delete('/api/jogos/:jogoId/goleiros/:goleiroId', async (req, res) => {
+  const { jogoId, goleiroId } = req.params;
+  await runDb('DELETE FROM goleiros_jogo WHERE id = ? AND jogo_id = ?', [goleiroId, jogoId]);
+  res.json({ message: 'Goleiro removido com sucesso.' });
+});
+
+app.get('/api/artilharia', async (req, res) => {
+  res.json(await getArtilharia());
+});
+
+app.get('/api/goleiros', async (req, res) => {
+  res.json(await getGoleiros());
+});
+
+app.get('/api/mensalidades', async (req, res) => {
+  const rows = await allDb(`
+    SELECT m.*, a.nome, a.apelido
+    FROM mensalidades m
+    JOIN atletas a ON a.id = m.atleta_id
+    ORDER BY m.ano DESC, m.mes DESC, a.nome ASC
+  `);
+  res.json(rows);
+});
+
+app.post('/api/mensalidades', async (req, res) => {
+  const body = req.body || {};
+  if (!body.atleta_id) return res.status(400).json({ error: 'Atleta obrigatório.' });
+  if (!body.mes || !body.ano) return res.status(400).json({ error: 'Mês e ano são obrigatórios.' });
+
+  const existing = await getDb('SELECT id FROM mensalidades WHERE atleta_id = ? AND mes = ? AND ano = ?', [body.atleta_id, body.mes, body.ano]);
+  if (existing) {
+    return res.status(400).json({ error: 'Já existe uma mensalidade cadastrada para esse atleta, mês e ano.' });
+  }
+
+  const valor = Number(body.valor || 0);
+  await runDb(`
+    INSERT INTO mensalidades (atleta_id, mes, ano, valor, status, data_pagamento, forma_pagamento, observacao)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [body.atleta_id, body.mes, body.ano, valor, body.status || 'pendente', body.data_pagamento || '', body.forma_pagamento || '', body.observacao || '']);
+
+  const item = await getDb('SELECT * FROM mensalidades ORDER BY id DESC LIMIT 1');
+  res.status(201).json({ message: 'Mensalidade registrada com sucesso.', item });
+});
+
+app.put('/api/mensalidades/:id', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+  const item = await getDb('SELECT * FROM mensalidades WHERE id = ?', [id]);
+  if (!item) return res.status(404).json({ error: 'Mensalidade não encontrada.' });
+
+  await runDb(`
+    UPDATE mensalidades
+    SET atleta_id = ?, mes = ?, ano = ?, valor = ?, status = ?, data_pagamento = ?, forma_pagamento = ?, observacao = ?
+    WHERE id = ?
+  `, [
+    body.atleta_id || item.atleta_id,
+    body.mes || item.mes,
+    body.ano || item.ano,
+    Number(body.valor || item.valor || 0),
+    body.status || item.status,
+    body.data_pagamento || item.data_pagamento,
+    body.forma_pagamento || item.forma_pagamento,
+    body.observacao || item.observacao,
+    id
+  ]);
+
+  const atualizado = await getDb('SELECT * FROM mensalidades WHERE id = ?', [id]);
+  res.json({ message: 'Mensalidade atualizada com sucesso.', item: atualizado });
+});
+
+app.delete('/api/mensalidades/:id', async (req, res) => {
+  const { id } = req.params;
+  await runDb('DELETE FROM mensalidades WHERE id = ?', [id]);
+  res.json({ message: 'Mensalidade removida com sucesso.' });
+});
+
+app.get('/api/relatorios', async (req, res) => {
+  const dados = await getRelatorios();
+  const artilharia = await getArtilharia();
+  const goleiros = await getGoleiros();
+  const mensalidades = await allDb(`SELECT * FROM mensalidades`);
+
+  res.json({
+    jogos: dados,
+    artilharia: artilharia.slice(0, 10),
+    goleiros: goleiros.slice(0, 10),
+    mensalidades,
+    totalRecebido: mensalidades.filter((m) => m.status === 'pago').reduce((sum, item) => sum + Number(item.valor || 0), 0),
+    totalPendente: mensalidades.filter((m) => m.status === 'pendente').reduce((sum, item) => sum + Number(item.valor || 0), 0)
+  });
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+const start = async () => {
+  await initDatabase();
+  app.listen(PORT, () => {
+    console.log(`Gestão da Patota rodando em http://localhost:${PORT}`);
+  });
+};
+
+start();
